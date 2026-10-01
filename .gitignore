@@ -1,0 +1,16 @@
+# Credenciais pessoais - NAO enviar
+credentials.json
+token.json
+
+# Estado e logs locais
+estado_robo_peterson.json
+robo_migracao_peterson.log
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Temporarios
+*.tmp
+*.bak
