@@ -320,10 +320,11 @@ def msg_hash(msg: str) -> str:
 
 def importar_whatsapp():
     try:
-        from pywinauto import Desktop
+        from pywinauto import Desktop, keyboard
+        import pyperclip
     except ImportError as exc:
-        raise RuntimeError("pywinauto não instalado. Rode o BAT do robô.") from exc
-    return Desktop
+        raise RuntimeError("Dependências do WhatsApp ausentes. Rode o BAT do robô.") from exc
+    return Desktop, keyboard, pyperclip
 
 
 def janela_whatsapp(Desktop):
@@ -372,14 +373,27 @@ def visiveis(window):
 
 
 def confirmar_conversa(window, profissional, telefone) -> bool:
+    # Confirma pelo cabeçalho da conversa, não pelo painel esquerdo.
+    # Isso evita considerar outra conversa com o mesmo nome/telefone.
     ultimos = telefone[-8:]
     nome = profissional.lower()
+    wr = window.rectangle()
+    topo_limite = wr.top + 135
+    esquerda_min = wr.left + (wr.right - wr.left) * 0.38
+
     for c, cname, aid, wt, ctype, rect in visiveis(window):
+        left, top, right, bottom = rect
+        if top > topo_limite or left < esquerda_min:
+            continue
+
         alvo = f"{cname} {aid} {wt}".lower()
-        if ultimos and ultimos in re.sub(r"\D", "", alvo):
+        numeros = re.sub(r"\D", "", alvo)
+
+        if ultimos and ultimos in numeros:
             return True
         if nome and nome in alvo:
             return True
+
     return False
 
 
@@ -435,7 +449,9 @@ def campo_mensagem(window):
 def botao_por_texto(window, termos):
     termos = tuple(t.lower() for t in termos)
     for c, name, aid, wt, ctype, rect in visiveis(window):
-        if ctype.lower() not in ("button", "menuitem", "listitem", "checkbox", "text"):
+        if ctype.lower() not in (
+            "button", "menuitem", "listitem", "checkbox", "text",
+        ):
             continue
         alvo = f"{name} {aid} {wt}".lower()
         if any(t in alvo for t in termos):
@@ -443,97 +459,117 @@ def botao_por_texto(window, termos):
     return None
 
 
+def janela_ou_popups(Desktop):
+    """Retorna todas as janelas UIA atuais; menus do WhatsApp podem ser popups separados."""
+    try:
+        return Desktop(backend="uia").windows()
+    except Exception:
+        return []
+
+
+def localizar_em_todas_janelas(Desktop, termos, tipos=None):
+    termos = tuple(t.lower() for t in termos)
+    for win in janela_ou_popups(Desktop):
+        for c, name, aid, wt, ctype, rect in visiveis(win):
+            if tipos and ctype.lower() not in tipos:
+                continue
+            alvo = f"{name} {aid} {wt}".lower()
+            if any(t in alvo for t in termos):
+                return win, c
+    return None, None
+
+
 def botao_enviar(window):
-    c = botao_por_texto(window, ("enviar", "send", "send message"))
-    if c:
-        return c
+    # O botão é dinâmico no WebView. Priorizamos o nome acessível.
+    return botao_por_texto(
+        window,
+        ("enviar", "send", "send message"),
+    )
 
-    # Fallback geométrico: botão no canto inferior direito da janela.
+
+def snapshot_painel_conversas(window):
+    """Leitura leve do painel esquerdo para confirmar que o preview mudou após o envio."""
     wr = window.rectangle()
-    candidatos = []
+    limite = wr.left + (wr.right - wr.left) * 0.38
+    valores = []
+
     for c, name, aid, wt, ctype, rect in visiveis(window):
-        if ctype.lower() != "button":
-            continue
-        left, top, right, bottom = rect
-        if right >= wr.right - 30 and bottom >= wr.bottom - 120:
-            candidatos.append((bottom, right, c))
-    if candidatos:
-        candidatos.sort()
-        return candidatos[-1][2]
-    return None
+        if rect[0] < limite and wt:
+            valores.append(wt)
+
+    return "\n".join(valores).lower()
 
 
-def snapshot_textos_conversa(window):
-    wr = window.rectangle()
-    limiar = wr.left + 230
-    out = []
-    for c, name, aid, wt, ctype, rect in visiveis(window):
-        if rect[0] > limiar and wt:
-            out.append(wt)
-    return "\n".join(out)
-
-
-def texto_enviado_apareceu(window, mensagem) -> bool:
-    primeira = texto(mensagem.splitlines()[0]).lower()
-    if not primeira:
+def texto_enviado_apareceu(window, mensagem):
+    marcador = texto(mensagem.splitlines()[0]).lower().strip()
+    if not marcador:
         return False
-    snap = snapshot_textos_conversa(window).lower()
-    return primeira[:30] in snap
+    # O preview da conversa na lateral normalmente expõe a última mensagem.
+    snap = snapshot_painel_conversas(window)
+    return marcador[:24] in snap
 
 
-def enviar_confirmado(window, mensagem):
-    # A mensagem é inserida diretamente no controle. Não usa mouse.
+def campo_vazio(campo):
+    try:
+        valor = campo.get_value()
+        return valor is None or str(valor).strip() == ""
+    except Exception:
+        try:
+            valor = campo.window_text()
+            return valor is None or str(valor).strip() == ""
+        except Exception:
+            return False
+
+
+def enviar_confirmado(window, mensagem, keyboard, pyperclip):
     campo = campo_mensagem(window)
     if campo is None:
         raise RuntimeError("Caixa de mensagem não encontrada.")
 
+    # set_edit_text pode alterar visualmente o WebView sem gerar o mesmo evento
+    # de entrada que o WhatsApp espera. Por isso usamos foco via UIA + Ctrl+V:
+    # não move mouse e simula uma entrada real no campo.
     try:
-        campo.set_edit_text(mensagem)
+        campo.set_focus()
+        pyperclip.copy(mensagem)
+        keyboard.send_keys("^a")
+        keyboard.send_keys("^v")
     except Exception as exc:
         raise RuntimeError(
-            f"Não consegui inserir a mensagem diretamente no campo: {exc}"
+            f"Não consegui inserir a mensagem pelo teclado/UIA: {exc}"
         ) from exc
 
     time.sleep(ESPERA_COLAR)
 
-    botao = botao_enviar(window)
-    if botao is not None:
-        acionado = False
-        try:
-            botao.invoke()
-            acionado = True
-        except Exception:
-            pass
-        if not acionado:
-            try:
-                botao.set_focus()
-                botao.type_keys("{ENTER}", set_foreground=False)
-                acionado = True
-            except Exception:
-                pass
-        if not acionado:
-            try:
-                campo.set_focus()
-                campo.type_keys("{ENTER}", set_foreground=False)
-                acionado = True
-            except Exception as exc:
-                raise RuntimeError(f"Não consegui acionar Enviar: {exc}") from exc
-    else:
-        try:
-            campo.set_focus()
-            campo.type_keys("{ENTER}", set_foreground=False)
-        except Exception as exc:
-            raise RuntimeError(f"Botão Enviar não encontrado e Enter falhou: {exc}") from exc
+    # O Enter é enviado para o controle focado. Não usa mouse.
+    try:
+        campo.set_focus()
+        keyboard.send_keys("{ENTER}")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Não consegui confirmar o envio pelo teclado: {exc}"
+        ) from exc
 
-    # CONFIRMAÇÃO FORTE: NÃO aceitamos apenas "campo vazio".
+    # Confirmamos com DUAS evidências quando a UI permite:
+    # 1) preview lateral alterado; 2) campo vazio.
     limite = time.time() + TIMEOUT_ENVIO
     while time.time() < limite:
-        time.sleep(0.45)
+        time.sleep(0.35)
+
         if texto_enviado_apareceu(window, mensagem):
             return
 
+        if campo_vazio(campo):
+            # Campo vazio sozinho não é suficiente; damos uma janela curta
+            # para o preview aparecer.
+            janela_preview = time.time() + 1.8
+            while time.time() < janela_preview:
+                time.sleep(0.25)
+                if texto_enviado_apareceu(window, mensagem):
+                    return
+
     raise RuntimeError(
-        "A mensagem não apareceu na conversa após o envio. "
+        "A UI do WhatsApp não confirmou o envio. "
         "O Google Sheets NÃO será atualizado."
     )
 
@@ -558,88 +594,95 @@ def abrir_e_confirmar(window, telefone, profissional):
 # =========================
 
 
-def aplicar_etiqueta(window) -> tuple[bool, str]:
-    # Usa UI Automation; não move mouse.
+def acionar_ui(control):
+    try:
+        control.invoke()
+        return True
+    except Exception:
+        pass
+    try:
+        control.set_focus()
+        control.type_keys("{ENTER}", set_foreground=False)
+        return True
+    except Exception:
+        return False
+
+
+def aplicar_etiqueta(window, Desktop) -> tuple[bool, str]:
+    # O menu "Adicionar à lista" pode aparecer em uma janela popup separada.
     menu = botao_por_texto(
         window,
-        (
-            "mais opções",
-            "mais opcoes",
-            "more options",
-        ),
+        ("mais opções", "mais opcoes", "more options"),
     )
 
     if menu is None:
-        # Procura o botão de menu pela posição relativa no topo direito.
         wr = window.rectangle()
         candidatos = []
         for c, name, aid, wt, ctype, rect in visiveis(window):
             if ctype.lower() != "button":
                 continue
             left, top, right, bottom = rect
-            if right > wr.right - 80 and top < wr.top + 120:
+            if right >= wr.right - 90 and top <= wr.top + 120:
                 candidatos.append((right, bottom, c))
         if candidatos:
             candidatos.sort()
             menu = candidatos[-1][2]
 
-    if menu is None:
+    if menu is None or not acionar_ui(menu):
         return False, "Menu de conversa não encontrado."
-
-    try:
-        menu.invoke()
-    except Exception:
-        try:
-            menu.set_focus()
-            menu.type_keys("{ENTER}", set_foreground=False)
-        except Exception:
-            return False, "Não consegui abrir o menu."
 
     time.sleep(ESPERA_MENU)
 
-    # Na interface mostrada pelo usuário, a ação é "Adicionar à lista".
-    item = botao_por_texto(
-        window,
-        (
-            "adicionar à lista",
-            "adicionar a lista",
-            "add to list",
-        ),
+    # Primeiro tenta localizar "Adicionar à lista" em TODAS as janelas.
+    popup, item = localizar_em_todas_janelas(
+        Desktop,
+        ("adicionar à lista", "adicionar a lista", "add to list"),
     )
 
     if item is None:
         return False, "Opção 'Adicionar à lista' não encontrada."
 
-    try:
-        item.invoke()
-    except Exception:
-        try:
-            item.set_focus()
-            item.type_keys("{ENTER}", set_foreground=False)
-        except Exception:
-            return False, "Não consegui abrir 'Adicionar à lista'."
+    if not acionar_ui(item):
+        return False, "Não consegui abrir 'Adicionar à lista'."
 
     time.sleep(ESPERA_MENU)
 
-    label = botao_por_texto(
-        window,
+    # Agora procura a etiqueta em TODAS as janelas/popups.
+    popup2, label = localizar_em_todas_janelas(
+        Desktop,
         (NOME_ETIQUETA,),
     )
 
     if label is None:
+        # Se houver um campo de busca no popup, usamos teclado/UIA.
+        for win in janela_ou_popups(Desktop):
+            for c, name, aid, wt, ctype, rect in visiveis(win):
+                if ctype.lower() != "edit":
+                    continue
+                try:
+                    c.set_focus()
+                    # Busca da lista de etiquetas, se presente.
+                    c.type_keys(NOME_ETIQUETA, set_foreground=False)
+                    time.sleep(0.35)
+                    p, found = localizar_em_todas_janelas(
+                        Desktop,
+                        (NOME_ETIQUETA,),
+                    )
+                    if found is not None:
+                        label = found
+                        break
+                except Exception:
+                    pass
+            if label is not None:
+                break
+
+    if label is None:
         return False, f"Etiqueta '{NOME_ETIQUETA}' não encontrada."
 
-    try:
-        label.invoke()
-    except Exception:
-        try:
-            label.set_focus()
-            label.type_keys("{ENTER}", set_foreground=False)
-        except Exception:
-            return False, f"Não consegui selecionar '{NOME_ETIQUETA}'."
+    if not acionar_ui(label):
+        return False, f"Não consegui selecionar '{NOME_ETIQUETA}'."
 
-    time.sleep(ESPERA_MENU)
-
+    time.sleep(ESPERA_LABEL)
     return True, "Etiqueta aplicada."
 
 
@@ -660,7 +703,7 @@ def contatos_em_andamento(api):
 
 
 def etiquetar(api, quantidade):
-    Desktop = importar_whatsapp()
+    Desktop, keyboard, pyperclip = importar_whatsapp()
     window = janela_whatsapp(Desktop)
     itens = contatos_em_andamento(api)
     if not itens:
@@ -675,7 +718,7 @@ def etiquetar(api, quantidade):
     for i, item in enumerate(itens[:qtd], 1):
         try:
             abrir_e_confirmar(window, item["telefone"], item["profissional"])
-            sucesso, motivo = aplicar_etiqueta(window)
+            sucesso, motivo = aplicar_etiqueta(window, Desktop)
             if sucesso:
                 ok += 1
                 log(f"[ETQ {i}/{qtd}] ✅ {item['profissional']}")
@@ -697,7 +740,7 @@ def etiquetar(api, quantidade):
 
 
 def enviar_lote(api, quantidade):
-    Desktop = importar_whatsapp()
+    Desktop, keyboard, pyperclip = importar_whatsapp()
     window = janela_whatsapp(Desktop)
     data = ler_planilha(api)
     fila = montar_fila(data)
@@ -736,7 +779,7 @@ def enviar_lote(api, quantidade):
         try:
             log(f"[{pos}/{qtd}] Abrindo/enviando | {item['profissional']}")
             abrir_e_confirmar(window, item["telefone"], item["profissional"])
-            enviar_confirmado(window, msg)
+            enviar_confirmado(window, msg, keyboard, pyperclip)
 
             # Estado local primeiro, para proteção contra duplicação.
             confirmados[chave] = {
@@ -754,7 +797,7 @@ def enviar_lote(api, quantidade):
             log(f"[{pos}/{qtd}] ✅ ENVIO CONFIRMADO | linha={item['linha']}")
 
             # Etiqueta: se falhar, o envio continua válido e O será atualizado.
-            sucesso_etq, motivo = aplicar_etiqueta(window)
+            sucesso_etq, motivo = aplicar_etiqueta(window, Desktop)
             if sucesso_etq:
                 etiquetas_ok += 1
                 log(f"[{pos}/{qtd}] 🏷️ Etiqueta OK | {item['profissional']}")

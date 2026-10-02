@@ -23,7 +23,7 @@ if not exist "token.json" (
 )
 
 echo Instalando/atualizando dependencias...
-py -m pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib pywinauto pywin32 pyautogui pyperclip
+py -m pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib pywinauto pywin32 pyperclip
 
 if errorlevel 1 (
     echo.
